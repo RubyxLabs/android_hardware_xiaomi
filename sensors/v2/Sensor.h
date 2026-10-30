@@ -21,8 +21,8 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <condition_variable>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -54,7 +54,7 @@ class Sensor {
 
     const SensorInfo& getSensorInfo() const;
     virtual void batch(int32_t samplingPeriodNs);
-    virtual void activate(bool enable);
+    virtual Result activate(bool enable);
     virtual Result flush();
 
     virtual void setOperationMode(OperationMode mode);
@@ -100,9 +100,8 @@ class SysfsPollingOneShotSensor : public OneShotSensor {
                               SensorType type);
     virtual ~SysfsPollingOneShotSensor() override;
 
-    virtual void activate(bool enable) override;
-    virtual void activate(bool enable, bool notify, bool lock);
-    virtual void writeEnable(bool enable);
+    virtual Result activate(bool enable) override;
+    virtual bool writeEnable(bool enable);
     virtual void setOperationMode(OperationMode mode) override;
     virtual std::vector<Event> readEvents() override;
     virtual void fillEventData(Event& event);
@@ -110,17 +109,13 @@ class SysfsPollingOneShotSensor : public OneShotSensor {
 
   protected:
     virtual void run() override;
-
-    std::ofstream mEnableStream;
-
   private:
     void interruptPoll();
 
-    struct pollfd mPolls[2];
-    int mWaitPipeFd[2];
-    int mPollFd;
+    struct pollfd mPolls[2] = {};
+    int mWaitPipeFd[2] = {-1, -1};
+    int mPollFd = -1;
     std::string mEnablePath;
-    std::once_flag mEnableOpenOnce;
 };
 
 class DoubleTapSensor : public SysfsPollingOneShotSensor {

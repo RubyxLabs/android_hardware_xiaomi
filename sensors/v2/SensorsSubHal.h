@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <map>
+#include <sstream>
 #include <vector>
 
 #include "Sensor.h"
@@ -65,7 +67,7 @@ class SensorsSubHal : public ISensorsSubHal, public ISensorsEventCallback {
 
     Return<void> debug(const hidl_handle& fd, const hidl_vec<hidl_string>& args);
 
-    const std::string getName() { return "FakeSubHal"; }
+    const std::string getName() { return "XiaomiSubHal"; }
 
     void postEvents(const std::vector<Event>& events, bool wakeup) override;
 

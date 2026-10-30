@@ -65,8 +65,7 @@ Return<Result> SensorsSubHal::setOperationMode(OperationMode mode) {
 Return<Result> SensorsSubHal::activate(int32_t sensorHandle, bool enabled) {
     auto sensor = mSensors.find(sensorHandle);
     if (sensor != mSensors.end()) {
-        sensor->second->activate(enabled);
-        return Result::OK;
+        return sensor->second->activate(enabled);
     }
     return Result::BAD_VALUE;
 }
@@ -147,6 +146,9 @@ Return<void> SensorsSubHal::debug(const hidl_handle& fd, const hidl_vec<hidl_str
 }
 
 Return<Result> SensorsSubHal::initialize(const sp<IHalProxyCallback>& halProxyCallback) {
+    for (auto& sensor : mSensors) {
+        sensor.second->activate(false);
+    }
     mCallback = halProxyCallback;
     setOperationMode(OperationMode::NORMAL);
     return Result::OK;

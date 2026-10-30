@@ -20,7 +20,10 @@
 #include <log/log.h>
 #include <utils/SystemClock.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstring>
 
 namespace {
 
@@ -42,7 +45,7 @@ static bool readBool(int fd, bool seek) {
         return false;
     }
 
-    return c != '0';
+    return c == '1';
 }
 
 }  // anonymous namespace
@@ -67,6 +70,7 @@ Sensor::Sensor(int32_t sensorHandle, ISensorsEventCallback* callback)
     : mIsEnabled(false),
       mSamplingPeriodNs(0),
       mLastSampleTimeNs(0),
+      mStopThread(false),
       mCallback(callback),
       mMode(OperationMode::NORMAL) {
     mSensorInfo.sensorHandle = sensorHandle;
@@ -78,7 +82,6 @@ Sensor::Sensor(int32_t sensorHandle, ISensorsEventCallback* callback)
     mSensorInfo.fifoMaxEventCount = 0;
     mSensorInfo.requiredPermission = "";
     mSensorInfo.flags = 0;
-    mRunThread = std::thread(startThread, this);
 }
 
 Sensor::~Sensor() {
@@ -90,7 +93,7 @@ Sensor::~Sensor() {
         mIsEnabled = false;
         mWaitCV.notify_all();
     }
-    mRunThread.join();
+    if (mRunThread.joinable()) mRunThread.join();
 }
 
 const SensorInfo& Sensor::getSensorInfo() const {
@@ -108,12 +111,13 @@ void Sensor::batch(int32_t samplingPeriodNs) {
     }
 }
 
-void Sensor::activate(bool enable) {
+Result Sensor::activate(bool enable) {
     std::lock_guard<std::mutex> lock(mRunMutex);
     if (mIsEnabled != enable) {
         mIsEnabled = enable;
         mWaitCV.notify_all();
     }
+    return Result::OK;
 }
 
 Result Sensor::flush() {
@@ -232,14 +236,14 @@ SysfsPollingOneShotSensor::SysfsPollingOneShotSensor(
 
     int rc;
 
-    rc = pipe(mWaitPipeFd);
+    rc = pipe2(mWaitPipeFd, O_CLOEXEC | O_NONBLOCK);
     if (rc < 0) {
         mWaitPipeFd[0] = -1;
         mWaitPipeFd[1] = -1;
         ALOGE("failed to open wait pipe: %d", rc);
     }
 
-    mPollFd = open(pollPath.c_str(), O_RDONLY);
+    mPollFd = open(pollPath.c_str(), O_RDONLY | O_CLOEXEC);
     if (mPollFd < 0) {
         ALOGE("failed to open poll fd: %d", mPollFd);
     }
@@ -258,52 +262,67 @@ SysfsPollingOneShotSensor::SysfsPollingOneShotSensor(
             .fd = mPollFd,
             .events = POLLERR | POLLPRI,
     };
+
+    // Consume the initial sysfs notification before arming the sensor.
+    readBool(mPollFd, true /* seek */);
+    // The base constructor must not start a virtual worker on an incomplete object.
+    mRunThread = std::thread(startThread, this);
 }
 
 SysfsPollingOneShotSensor::~SysfsPollingOneShotSensor() {
+    {
+        std::lock_guard<std::mutex> lock(mRunMutex);
+        mStopThread = true;
+        mIsEnabled = false;
+        writeEnable(false);
+        mWaitCV.notify_all();
+    }
     interruptPoll();
+    if (mRunThread.joinable()) mRunThread.join();
+    if (mPollFd >= 0) close(mPollFd);
+    if (mWaitPipeFd[0] >= 0) close(mWaitPipeFd[0]);
+    if (mWaitPipeFd[1] >= 0) close(mWaitPipeFd[1]);
 }
 
-void SysfsPollingOneShotSensor::writeEnable(bool enable) {
-    std::call_once(mEnableOpenOnce, [&] { mEnableStream.open(mEnablePath); });
-
-    if (mEnableStream) {
-        mEnableStream << (enable ? '1' : '0') << std::flush;
-    } else {
+bool SysfsPollingOneShotSensor::writeEnable(bool enable) {
+    int fd = open(mEnablePath.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        ALOGE("Failed to open %s: %s", mEnablePath.c_str(), strerror(errno));
+        return false;
+    }
+    const char value = enable ? '1' : '0';
+    const bool success = TEMP_FAILURE_RETRY(write(fd, &value, sizeof(value))) == 1;
+    close(fd);
+    if (!success) {
         ALOGE("Failed to write enable to %s", mEnablePath.c_str());
     }
+    return success;
 }
 
-void SysfsPollingOneShotSensor::activate(bool enable, bool notify, bool lock) {
-    std::unique_lock<std::mutex> runLock(mRunMutex, std::defer_lock);
-
-    if (lock) {
-        runLock.lock();
+Result SysfsPollingOneShotSensor::activate(bool enable) {
+    std::lock_guard<std::mutex> lock(mRunMutex);
+    if (mStopThread) return Result::INVALID_OPERATION;
+    if (enable && mIsEnabled) return Result::OK;
+    if (enable) {
+        // Discard a notification left over from a cancelled registration.
+        readFd(mPollFd);
     }
-
-    if (mIsEnabled != enable) {
-        writeEnable(enable);
-
-        mIsEnabled = enable;
-
-        if (notify) {
-            interruptPoll();
-            mWaitCV.notify_all();
-        }
+    if (!writeEnable(enable && mMode == OperationMode::NORMAL)) {
+        return Result::INVALID_OPERATION;
     }
-
-    if (lock) {
-        runLock.unlock();
-    }
-}
-
-void SysfsPollingOneShotSensor::activate(bool enable) {
-    activate(enable, true, true);
+    mIsEnabled = enable;
+    interruptPoll();
+    mWaitCV.notify_all();
+    return Result::OK;
 }
 
 void SysfsPollingOneShotSensor::setOperationMode(OperationMode mode) {
-    Sensor::setOperationMode(mode);
+    std::lock_guard<std::mutex> lock(mRunMutex);
+    if (mStopThread) return;
+    if (!writeEnable(mIsEnabled && mode == OperationMode::NORMAL)) return;
+    mMode = mode;
     interruptPoll();
+    mWaitCV.notify_all();
 }
 
 void SysfsPollingOneShotSensor::run() {
@@ -317,7 +336,7 @@ void SysfsPollingOneShotSensor::run() {
         } else {
             // Cannot hold lock while polling.
             runLock.unlock();
-            int rc = poll(mPolls, 2, -1);
+            int rc = TEMP_FAILURE_RETRY(poll(mPolls, 2, -1));
             runLock.lock();
 
             if (rc < 0) {
@@ -326,11 +345,19 @@ void SysfsPollingOneShotSensor::run() {
                 continue;
             }
 
-            if (mPolls[1].revents == mPolls[1].events && readFd(mPollFd)) {
-                activate(false, false, false);
+            if (mPolls[0].revents & POLLIN) {
+                char buffer[64];
+                while (read(mWaitPipeFd[0], buffer, sizeof(buffer)) > 0) {}
+            }
+            if (mStopThread || !mIsEnabled || mMode != OperationMode::NORMAL) continue;
+            if ((mPolls[1].revents & POLLPRI) && readFd(mPollFd)) {
+                // One-shot sensors deactivate before publishing their event.
+                mIsEnabled = false;
+                writeEnable(false);
                 mCallback->postEvents(readEvents(), isWakeUpSensor());
-            } else if (mPolls[0].revents == mPolls[0].events) {
-                readBool(mWaitPipeFd[0], false /* seek */);
+            } else if (mPolls[1].revents & (POLLHUP | POLLNVAL)) {
+                ALOGE("Sensor poll fd closed: %s", mSensorInfo.name.c_str());
+                mStopThread = true;
             }
         }
     }
@@ -340,12 +367,12 @@ void SysfsPollingOneShotSensor::interruptPoll() {
     if (mWaitPipeFd[1] < 0) return;
 
     char c = '1';
-    write(mWaitPipeFd[1], &c, sizeof(c));
+    TEMP_FAILURE_RETRY(write(mWaitPipeFd[1], &c, sizeof(c)));
 }
 
 std::vector<Event> SysfsPollingOneShotSensor::readEvents() {
     std::vector<Event> events;
-    Event event;
+    Event event{};
     event.sensorHandle = mSensorInfo.sensorHandle;
     event.sensorType = mSensorInfo.type;
     event.timestamp = ::android::elapsedRealtimeNano();
@@ -355,8 +382,8 @@ std::vector<Event> SysfsPollingOneShotSensor::readEvents() {
 }
 
 void SysfsPollingOneShotSensor::fillEventData(Event& event) {
-    event.u.data[0] = 0;
-    event.u.data[1] = 0;
+    event.u.data[0] = -1;
+    event.u.data[1] = -1;
 }
 
 bool SysfsPollingOneShotSensor::readFd(const int fd) {
@@ -378,11 +405,12 @@ bool UdfpsSensor::readFd(const int fd) {
         ALOGE("failed to seek: %d", rc);
         return false;
     }
-    rc = read(fd, &buffer, sizeof(buffer));
+    rc = read(fd, &buffer, sizeof(buffer) - 1);
     if (rc < 0) {
         ALOGE("failed to read state: %d", rc);
         return false;
     }
+    buffer[rc] = '\0';
     rc = sscanf(buffer, "%d,%d,%d", &mScreenX, &mScreenY, &state);
     if (rc == 1) {
         // If fod_press_status contains only one value,
